@@ -2,9 +2,9 @@ name: 每日更新复盘工作台
 
 on:
   schedule:
-    # UTC 09:10 = 北京时间 17:10，周一到周五
-    - cron: '10 9 * * 1-5'
-  # 也可以在网页上手动点一下跑
+    # 实测：GitHub 按美国西部时间(PST, UTC-8)解释这个 cron
+    # 01:10 PST = 09:10 UTC = 北京时间 17:10
+    - cron: '10 1 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -18,22 +18,44 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # 关键：让 Python / Node / shell 全部按北京时间处理
+    # 否则封板时间会差 8 小时、日期判断也会错
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
 
+      # 安全阀：只在北京时间 16:00-20:00 之间真正执行
+      # 防止 cron 换算有偏差时，在早盘跑出脏数据
+      - name: 检查时间窗口
+        id: guard
+        run: |
+          h=$(TZ=Asia/Shanghai date +%H)
+          now=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
+          if [ "$h" -ge 16 ] && [ "$h" -le 20 ]; then
+            echo "go=true" >> $GITHUB_OUTPUT
+            echo "北京时间 $now，在窗口内，开始执行"
+          else
+            echo "go=false" >> $GITHUB_OUTPUT
+            echo "北京时间 $now，不在 16:00-20:00 窗口内，本次跳过"
+          fi
+
       - name: 安装 Node
+        if: steps.guard.outputs.go == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: 安装 Python
+        if: steps.guard.outputs.go == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 抓取同花顺涨停池
+        if: steps.guard.outputs.go == 'true'
         run: |
           set +e
           node scripts/fetch.js
@@ -48,9 +70,11 @@ jobs:
           fi
 
       - name: 构建页面
+        if: steps.guard.outputs.go == 'true'
         run: python scripts/build.py
 
       - name: 提交并推送
+        if: steps.guard.outputs.go == 'true'
         run: |
           git config user.name "fupan-bot"
           git config user.email "fupan-bot@users.noreply.github.com"
@@ -58,13 +82,14 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有变化，跳过提交"
           else
-            git commit -m "自动更新 $(date -u +%Y-%m-%d)"
+            git commit -m "自动更新 $(TZ=Asia/Shanghai date +%Y-%m-%d)"
             git push
           fi
 
       - name: 汇总
+        if: steps.guard.outputs.go == 'true'
         run: |
           echo "### 更新完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "北京时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
           echo "页面大小：$(stat -c%s index.html) 字节" >> $GITHUB_STEP_SUMMARY
           echo "数据文件数：$(ls data/raw | wc -l)" >> $GITHUB_STEP_SUMMARY

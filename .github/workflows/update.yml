@@ -2,9 +2,11 @@ name: 每日更新复盘工作台
 
 on:
   schedule:
-    # 实测：GitHub 按美国西部时间(PST, UTC-8)解释这个 cron
-    # 01:10 PST = 09:10 UTC = 北京时间 17:10
-    - cron: '10 1 * * 1-5'
+    # 每 30 分钟试一次。
+    # 不再指望 GitHub 的 cron 准点——实测两次 schedule 落在北京 17:04 和 15:52，
+    # 和 cron 写的时刻对不上任何固定时区，官方也承认「负载高时可能延迟」且无上限。
+    # 所以改成：全天高频试，真正抓不抓由下面两个守卫决定。
+    - cron: '*/30 * * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -27,20 +29,53 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      # 安全阀：只在北京时间 16:00-20:00 之间真正执行
-      # 防止 cron 换算有偏差时，在早盘跑出脏数据
-      - name: 检查时间窗口
+      # 两个守卫都通过才真正抓：
+      #   1) 北京时间在 16:00-23:59（16 点后同花顺才定稿，放到 23:59 给调度漂移留余量）
+      #   2) 今天的数据文件还不存在（已抓过就不重复）
+      # 拦下时用 exit 78，让这次运行显示成灰色「跳过」，而不是假装成功的绿色。
+      - name: 判断是否该抓
         id: guard
         run: |
-          h=$(TZ=Asia/Shanghai date +%H)
-          now=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
-          if [ "$h" -ge 16 ] && [ "$h" -le 20 ]; then
+          now=$(date '+%Y-%m-%d %H:%M:%S')
+          h=$((10#$(date +%H)))
+          today=$(date +%Y%m%d)
+          raw="data/raw/$today.json"
+
+          echo "现在北京时间：$now"
+          echo "今天：$today"
+
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
             echo "go=true" >> $GITHUB_OUTPUT
-            echo "北京时间 $now，在窗口内，开始执行"
-          else
-            echo "go=false" >> $GITHUB_OUTPUT
-            echo "北京时间 $now，不在 16:00-20:00 窗口内，本次跳过"
+            echo "手动触发，直接执行"
+            exit 0
           fi
+
+          if [ "$h" -lt 16 ] || [ "$h" -gt 23 ]; then
+            echo "go=false" >> $GITHUB_OUTPUT
+            {
+              echo "### 本次跳过：时间窗口外"
+              echo ""
+              echo "- 北京时间：$now"
+              echo "- 规则：只在 16:00-23:59 之间抓（16 点后同花顺才定稿）"
+            } >> $GITHUB_STEP_SUMMARY
+            echo "::notice::北京时间 $now 不在 16:00-23:59 窗口内，本次不抓"
+            exit 78
+          fi
+
+          if [ -f "$raw" ] && grep -q '"zt_total":[[:space:]]*[1-9]' "$raw"; then
+            echo "go=false" >> $GITHUB_OUTPUT
+            {
+              echo "### 本次跳过：今天已经抓过"
+              echo ""
+              echo "- 北京时间：$now"
+              echo "- 数据文件：$raw"
+            } >> $GITHUB_STEP_SUMMARY
+            echo "::notice::今天的 $raw 已存在，不重复抓"
+            exit 78
+          fi
+
+          echo "go=true" >> $GITHUB_OUTPUT
+          echo "北京时间 $now，窗口内且今天未抓，开始执行"
 
       - name: 安装 Node
         if: steps.guard.outputs.go == 'true'
@@ -82,7 +117,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有变化，跳过提交"
           else
-            git commit -m "自动更新 $(TZ=Asia/Shanghai date +%Y-%m-%d)"
+            git commit -m "自动更新 $(date +%Y-%m-%d)"
             git push
           fi
 
@@ -90,6 +125,7 @@ jobs:
         if: steps.guard.outputs.go == 'true'
         run: |
           echo "### 更新完成" >> $GITHUB_STEP_SUMMARY
-          echo "北京时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
-          echo "页面大小：$(stat -c%s index.html) 字节" >> $GITHUB_STEP_SUMMARY
-          echo "数据文件数：$(ls data/raw | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 北京时间：$(date '+%Y-%m-%d %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "- 页面大小：$(stat -c%s index.html) 字节" >> $GITHUB_STEP_SUMMARY
+          echo "- 数据文件数：$(ls data/raw | wc -l)" >> $GITHUB_STEP_SUMMARY
